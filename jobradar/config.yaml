@@ -1,0 +1,114 @@
+# ---------------------------------------------------------------------------
+# Filter: een vacature wordt gemeld als de TITEL minstens één 'include'-woord
+# bevat en géén 'exclude'-woord. 'boost' = extra belangrijke melding (ster).
+# Hele woorden, hoofdletterongevoelig ("java" matcht dus niet "javascript").
+# ---------------------------------------------------------------------------
+include:
+  - java
+  - spring
+  - spring boot
+  - software developer
+  - software engineer
+  - softwareontwikkelaar
+  - developer
+  - ontwikkelaar
+  - backend
+  - back-end
+  - full stack
+  - fullstack
+  - full-stack
+  - young graduate
+  - starter
+  - trainee
+
+exclude:
+  - senior
+  - sr
+  - lead
+  - architect
+  - manager
+  - principal
+  - expert
+  - head
+  - freelance
+  - stage
+  - stagiair
+  - intern
+  - internship
+
+boost:
+  - junior
+  - starter
+  - young graduate
+  - graduate
+  - trainee
+  - entry level
+  - java
+  - spring boot
+
+# ---------------------------------------------------------------------------
+# Bronnen
+#   type: html -> haalt de pagina op en pakt alle links die aan link_regex voldoen
+#   type: mail -> leest alert-mails uit je Gmail (IMAP) van de afzender
+# Twijfel je over link_regex? Draai:  python radar.py --probe <url>
+# Geeft een bron "0 links", dan werkt de pagina met JavaScript of blokkeert ze bots.
+# Zet dan enabled: false en gebruik de e-mailalert van die site.
+# ---------------------------------------------------------------------------
+sources:
+  # --- Rechtstreeks (publieke zoekpagina's, geen login) --------------------
+  - name: VDAB
+    type: html
+    url: "https://www.vdab.be/vindeenjob/vacatures?trefwoord=java&sort=standaard"
+    link_regex: "/vindeenjob/vacatures/\\d+"
+    # Het patroon /vindeenjob/vacatures/<id>/<titel> is bevestigd. Of de lijst
+    # zonder JavaScript geladen wordt: testen met --probe.
+
+  - name: VDAB junior
+    type: html
+    url: "https://www.vdab.be/vindeenjob/vacatures?trefwoord=junior%20developer&sort=standaard"
+    link_regex: "/vindeenjob/vacatures/\\d+"
+
+  # ICTjob / Jobat: link_regex nog niet getest. Stappen:
+  #   1) python radar.py --probe "<zoekpagina-url met jouw zoekterm>"
+  #   2) kies het patroon dat alle vacature-links gemeen hebben
+  #   3) zet enabled: true
+  - name: ICTjob
+    type: html
+    enabled: false
+    url: "https://www.ictjob.be/nl/it-vacatures-zoeken?keywords=java"
+    link_regex: "ictjob\\.be/.*(vacature|job)/.+"
+
+  - name: Jobat
+    type: html
+    enabled: false
+    url: "https://www.jobat.be/nl/jobs?keywords=java"
+    link_regex: "jobat\\.be/nl/jobs/.+"
+
+  # --- Via e-mailalerts (LinkedIn, Indeed e.d. laten scrapen niet toe) -------
+  # Maak op elke site een alert en laat die naar je Gmail sturen.
+  # Pas link_regex aan met:  python radar.py --probe-mail linkedin.com
+  - name: LinkedIn (mail)
+    type: mail
+    from_contains: "linkedin.com"
+    link_regex: "linkedin\\.com/(comm/)?jobs/view/\\d+"
+
+  - name: Indeed (mail)
+    type: mail
+    from_contains: "indeed.com"
+    link_regex: "indeed\\.com/(rc/clk|viewjob)"
+    keep_params: ["jk"]       # bij Indeed zit het vacature-id in ?jk=...
+
+  - name: ICTjob (mail)
+    type: mail
+    from_contains: "ictjob"
+    link_regex: "ictjob\\.be/"
+
+  - name: Jobat (mail)
+    type: mail
+    from_contains: "jobat"
+    link_regex: "jobat\\.be/"
+
+  - name: VDAB (mail)
+    type: mail
+    from_contains: "vdab.be"
+    link_regex: "vdab\\.be/vindeenjob/vacatures/\\d+"
