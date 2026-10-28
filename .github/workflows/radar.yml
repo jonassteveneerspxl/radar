@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: "*/15 * * * *"   # GitHub kan dit uitstellen met enkele minuten
   workflow_dispatch:          # handmatig starten via het tabblad Actions
+    inputs:
+      mode:
+        description: "run = normaal, diagnose = toont per bron wat er binnenkomt"
+        type: choice
+        options: [run, diagnose]
+        default: run
 
 permissions:
   contents: write             # nodig om state/seen.json terug te committen
@@ -15,7 +21,7 @@ concurrency:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +33,7 @@ jobs:
       - run: pip install -r requirements.txt
 
       - name: Radar draaien
-        run: python radar.py
+        run: python radar.py ${{ github.event.inputs.mode == 'diagnose' && '--diagnose' || '' }}
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           IMAP_USER: ${{ secrets.IMAP_USER }}

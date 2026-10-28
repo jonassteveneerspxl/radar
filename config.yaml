@@ -20,8 +20,22 @@ include:
   - young graduate
   - starter
   - trainee
+  - programmeur
+  - analist programmeur
+  - analyst programmer
+  - software
+  - application developer
+  - applicatieontwikkelaar
+  - développeur
+  - web developer
 
 exclude:
+  - ervaren
+  - experienced
+  - medior
+  - mid-level
+  - confirmé
+  - gevorderd
   - senior
   - sr
   - lead
@@ -47,6 +61,29 @@ boost:
   - spring boot
 
 # ---------------------------------------------------------------------------
+# Tekstfilter: na de titelcheck wordt de vacaturepagina opgehaald en gelezen.
+#  - "starters welkom" / "geen ervaring vereist" -> altijd door
+#  - "3 jaar ervaring", "minimum 2 years of experience", "2-4 jaar" -> afgewezen als
+#    het minimum hoger is dan max_years. Zinnen met "pluspunt", "is a plus",
+#    "nice to have" tellen niet mee.
+#  - Lukt ophalen niet (LinkedIn/Indeed blokkeren vaak bots)? Dan krijg je de melding
+#    met "⚠ tekst niet gecontroleerd" (on_fetch_fail: notify) of niets (skip).
+# ---------------------------------------------------------------------------
+text_filter:
+  enabled: true
+  max_years: 1            # 0 = enkel starters; 1 = "1 jaar" mag nog; 2 = tot 2 jaar
+  on_fetch_fail: notify   # notify | skip
+  max_checks_per_run: 20
+  reject_phrases:         # losse uitdrukkingen die bijna altijd "ervaren" betekenen
+    - bewezen ervaring
+    - proven experience
+    - proven track record
+    - uitgebreide ervaring
+    - extensive experience
+    - aantoonbare ervaring
+    - expérience confirmée
+
+# ---------------------------------------------------------------------------
 # Bronnen
 #   type: html -> haalt de pagina op en pakt alle links die aan link_regex voldoen
 #   type: mail -> leest alert-mails uit je Gmail (IMAP) van de afzender
@@ -56,15 +93,17 @@ boost:
 # ---------------------------------------------------------------------------
 sources:
   # --- Rechtstreeks (publieke zoekpagina's, geen login) --------------------
+  # De VDAB-zoekpagina gaf 0 links (lijst wordt met JavaScript geladen): uitgezet.
+  # Gebruik de VDAB-mailalert hieronder.
   - name: VDAB
     type: html
+    enabled: false
     url: "https://www.vdab.be/vindeenjob/vacatures?trefwoord=java&sort=standaard"
     link_regex: "/vindeenjob/vacatures/\\d+"
-    # Het patroon /vindeenjob/vacatures/<id>/<titel> is bevestigd. Of de lijst
-    # zonder JavaScript geladen wordt: testen met --probe.
 
   - name: VDAB junior
     type: html
+    enabled: false
     url: "https://www.vdab.be/vindeenjob/vacatures?trefwoord=junior%20developer&sort=standaard"
     link_regex: "/vindeenjob/vacatures/\\d+"
 

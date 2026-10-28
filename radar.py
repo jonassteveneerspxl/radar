@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Vacature-radar: haalt vacatures op uit webpagina's en uit alert-mails,
-filtert ze en stuurt een pushmelding (ntfy) zodra er iets nieuws is.
+filtert ze (titel + vacaturetekst) en stuurt een pushmelding (ntfy) bij iets nieuws.
 
 Gebruik:
     python radar.py                 # normale run
     python radar.py --dry-run       # toont wat er verstuurd zou worden, verstuurt niets
+    python radar.py --diagnose      # toont per bron wat er binnenkomt en wat de regex pakt
     python radar.py --probe URL     # toont alle links op een pagina (om link_regex te kiezen)
     python radar.py --probe-mail X  # toont links in recente mails van afzender X
 """
@@ -44,6 +45,7 @@ class Job:
     source: str
     title: str
     url: str
+    note: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -52,8 +54,11 @@ class Job:
 def normalize_url(url: str, keep_params: tuple[str, ...] = ()) -> str:
     """Verwijdert tracking (query/fragment) behalve de params in keep_params."""
     p = urlsplit(url)
+    path = p.path.rstrip("/")
+    if "linkedin.com" in p.netloc:
+        path = path.replace("/comm/jobs/", "/jobs/")  # publieke weergave i.p.v. mail-tracking
     q = [(k, v) for k, v in parse_qsl(p.query) if k in keep_params]
-    return urlunsplit((p.scheme, p.netloc.lower(), p.path.rstrip("/"), urlencode(q), ""))
+    return urlunsplit((p.scheme, p.netloc.lower(), path, urlencode(q), ""))
 
 
 def title_from_url(url: str) -> str:
@@ -129,29 +134,37 @@ def parse_mail(raw: bytes, src: dict) -> list[Job]:
     return jobs
 
 
-def _imap_connect():
-    user, pw = os.environ.get("IMAP_USER"), os.environ.get("IMAP_PASSWORD")
-    if not (user and pw):
-        raise RuntimeError("IMAP_USER / IMAP_PASSWORD niet ingesteld")
-    host = os.environ.get("IMAP_HOST", "imap.gmail.com")
-    M = imaplib.IMAP4_SSL(host)
-    M.login(user, pw)
-    M.select("INBOX", readonly=True)
-    return M
+_imap_cache: dict = {}
+
+
+def _imap():
+    """Eén gedeelde IMAP-verbinding per run; een mislukte login wordt maar één keer gemeld."""
+    if "err" in _imap_cache:
+        raise _imap_cache["err"]
+    if "conn" not in _imap_cache:
+        try:
+            user, pw = os.environ.get("IMAP_USER"), os.environ.get("IMAP_PASSWORD")
+            if not (user and pw):
+                raise RuntimeError("IMAP_USER / IMAP_PASSWORD niet ingesteld")
+            M = imaplib.IMAP4_SSL(os.environ.get("IMAP_HOST", "imap.gmail.com"))
+            M.login(user, pw.replace(" ", ""))
+            M.select("INBOX", readonly=True)
+            _imap_cache["conn"] = M
+        except Exception as e:
+            _imap_cache["err"] = e
+            raise
+    return _imap_cache["conn"]
 
 
 def fetch_mails(sender: str, days: int = 3) -> list[bytes]:
-    M = _imap_connect()
-    try:
-        since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%d-%b-%Y")
-        _, data = M.search(None, "SINCE", since, "FROM", f'"{sender}"')
-        out = []
-        for num in data[0].split():
-            _, msg_data = M.fetch(num, "(RFC822)")
-            out.append(msg_data[0][1])
-        return out
-    finally:
-        M.logout()
+    M = _imap()
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%d-%b-%Y")
+    _, data = M.search(None, "SINCE", since, "FROM", f'"{sender}"')
+    out = []
+    for num in data[0].split():
+        _, msg_data = M.fetch(num, "(BODY.PEEK[])")
+        out.append(msg_data[0][1])
+    return out
 
 
 def fetch_mail_source(src: dict) -> list[Job]:
@@ -162,7 +175,7 @@ def fetch_mail_source(src: dict) -> list[Job]:
 
 
 # --------------------------------------------------------------------------
-# Filter
+# Titelfilter
 # --------------------------------------------------------------------------
 def compile_words(words: list[str]) -> re.Pattern | None:
     if not words:
@@ -187,13 +200,68 @@ class Matcher:
 
 
 # --------------------------------------------------------------------------
+# Tekstfilter: gevraagde ervaring in de vacaturetekst
+# --------------------------------------------------------------------------
+YEARS = r"(?:jaar|jaren|jr\.?|years?|yrs?|ans|années?)"
+YEARS_RX = re.compile(rf"(\d{{1,2}})(?:\s*[-–—]\s*(\d{{1,2}})|\s*\+)?\s*{YEARS}\b", re.I)
+EXP_RX = re.compile(r"ervaring|experience|expérience", re.I)
+SOFT_RX = re.compile(
+    r"pluspunt|\bplus\b|troef|nice[- ]to[- ]have|\basset\b|\bbonus\b|voordeel|advantage|"
+    r"\bpré\b|\batout\b|\bis een pre\b", re.I)
+STARTER_RX = re.compile(
+    r"geen (?:werk)?ervaring (?:vereist|nodig|gevraagd)|zonder (?:werk)?ervaring|"
+    r"(?:werk)?ervaring is (?:niet|geen) (?:vereist|nodig|noodzakelijk)|"
+    r"no (?:prior |previous |professional )?experience (?:is )?(?:required|needed|necessary)|"
+    r"(?:starters?|beginners?|young graduates?|fresh graduates?|schoolverlaters?|jonge afgestudeerden)\s+(?:zijn\s+|are\s+)?(?:welkom|welcome)|"
+    r"(?:starters?|beginners?)\s+welkom|ook (?:voor|als) starter|sans expérience|débutants? (?:accepté|bienvenu)",
+    re.I)
+
+
+def experience_verdict(text: str, tf: dict) -> tuple[bool, str]:
+    """Geeft (ok, reden). ok=False als de tekst duidelijk meer ervaring vraagt dan toegestaan."""
+    if STARTER_RX.search(text):
+        return True, "starters welkom / geen ervaring vereist"
+    max_years = tf.get("max_years", 1)
+    worst = 0
+    for sentence in re.split(r"[.!?\n•·;]+", text):
+        if not EXP_RX.search(sentence) or SOFT_RX.search(sentence):
+            continue
+        for m in YEARS_RX.finditer(sentence):
+            worst = max(worst, int(m.group(1)))  # bij 2-4 jaar telt het minimum (2)
+    if worst > max_years:
+        return False, f"{worst}+ jaar ervaring gevraagd"
+    low = text.lower()
+    for phrase in tf.get("reject_phrases", []):
+        if phrase.lower() in low:
+            return False, f"bevat '{phrase}'"
+    return True, f"{worst} jaar ervaring genoemd" if worst else ""
+
+
+def fetch_text(url: str) -> str | None:
+    """Tekst van de vacaturepagina, of None als ophalen mislukt (login-muur, 403, te weinig tekst)."""
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "nl-BE,nl;q=0.9,en;q=0.8"},
+                         timeout=8)
+        if r.status_code != 200 or any(x in r.url for x in ("authwall", "/login", "/uas/")):
+            return None
+        soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "nav", "footer", "header"]):
+            t.decompose()
+        text = soup.get_text("\n")
+        return text if len(text) > 400 else None
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------
 # Melding
 # --------------------------------------------------------------------------
 def notify(topic: str, job: Job, priority: bool) -> None:
+    msg = f"{job.source}\n{job.url}" + (f"\n{job.note}" if job.note else "")
     r = requests.post("https://ntfy.sh/", json={
         "topic": topic,
         "title": job.title[:150],
-        "message": f"{job.source}\n{job.url}",
+        "message": msg,
         "click": job.url,
         "priority": 4 if priority else 3,
         "tags": ["star" if priority else "briefcase"],
@@ -205,25 +273,40 @@ def notify(topic: str, job: Job, priority: bool) -> None:
 # --------------------------------------------------------------------------
 # Hoofdlogica
 # --------------------------------------------------------------------------
-def collect(cfg: dict) -> list[Job]:
+def collect(cfg: dict, errors: list[str]) -> list[Job]:
     jobs: list[Job] = []
+    mail_error_reported = False
     for src in cfg.get("sources", []):
         if not src.get("enabled", True):
             continue
         try:
             found = fetch_mail_source(src) if src["type"] == "mail" else fetch_html_source(src)
         except Exception as e:  # één kapotte bron mag de rest niet stoppen
-            print(f"[FOUT] {src['name']}: {e}", file=sys.stderr)
+            if src["type"] == "mail":
+                if not mail_error_reported:
+                    print(f"[FOUT] mail-login/lezen mislukt: {e}", file=sys.stderr)
+                    errors.append("mail")
+                    mail_error_reported = True
+            else:
+                print(f"[FOUT] {src['name']}: {e}", file=sys.stderr)
             continue
-        flag = "" if found else "  <-- 0 links: link_regex fout, pagina via JavaScript, of bot geblokkeerd?"
+        flag = "" if found else "  <-- 0 links: geen mails, link_regex fout, pagina via JavaScript of bot geblokkeerd?"
         print(f"[{src['name']}] {len(found)} links{flag}")
         jobs += found
     return jobs
 
 
+def _show(label: str, items: list[str], n: int = 8) -> None:
+    if items:
+        more = f" (+{len(items) - n} meer)" if len(items) > n else ""
+        print(f"  {label} ({len(items)}): " + " | ".join(items[:n]) + more)
+
+
 def run(dry: bool = False) -> int:
     cfg = load_config()
     matcher = Matcher(cfg)
+    tf = cfg.get("text_filter", {})
+    tf_on = tf.get("enabled", False)
     state = load_state()
     first_run = not state
     topic = os.environ.get("NTFY_TOPIC", "")
@@ -231,27 +314,55 @@ def run(dry: bool = False) -> int:
         print("NTFY_TOPIC niet ingesteld", file=sys.stderr)
         return 1
 
+    errors: list[str] = []
     now = time.time()
     seen_this_run: set[str] = set()
-    to_push: list[tuple[Job, bool]] = []
-    for job in collect(cfg):
+    candidates: list[tuple[Job, bool]] = []
+    title_rejected: list[str] = []
+    for job in collect(cfg, errors):
         if job.url in state or job.url in seen_this_run:
             continue
         seen_this_run.add(job.url)
         ok, prio = matcher.check(job)
         if ok:
-            to_push.append((job, prio))
+            candidates.append((job, prio))
         else:
+            title_rejected.append(job.title[:60])
             state[job.url] = now  # niet relevant: meteen als gezien markeren
 
-    to_push.sort(key=lambda x: not x[1])  # prioriteit eerst
+    candidates.sort(key=lambda x: not x[1])  # prioriteit eerst
+    to_push: list[tuple[Job, bool]] = []
+    text_rejected: list[str] = []
+    unchecked = 0
+    checks = 0
+    for job, prio in candidates:
+        if tf_on:
+            if checks >= tf.get("max_checks_per_run", 20):
+                continue  # niet als gezien markeren: volgende run
+            checks += 1
+            text = fetch_text(job.url)
+            if text is None:
+                unchecked += 1
+                if tf.get("on_fetch_fail", "notify") == "skip":
+                    state[job.url] = now
+                    continue
+                job.note = "⚠ tekst niet gecontroleerd, lees zelf na op ervaring"
+            else:
+                ok, reason = experience_verdict(text, tf)
+                if not ok:
+                    text_rejected.append(f"{job.title[:45]} [{reason}]")
+                    state[job.url] = now
+                    continue
+                job.note = f"✓ {reason}" if reason else ""
+        to_push.append((job, prio))
+
     pushed = 0
     for i, (job, prio) in enumerate(to_push):
         if first_run and i >= MAX_FIRST_RUN_PUSHES:
             state[job.url] = now  # eerste run: niet je telefoon overspoelen
             continue
         if dry:
-            print(f"  [DRY] {'*' if prio else ' '} {job.source}: {job.title} -> {job.url}")
+            print(f"  [DRY] {'*' if prio else ' '} {job.source}: {job.title} {job.note} -> {job.url}")
         else:
             try:
                 notify(topic, job, prio)
@@ -261,12 +372,18 @@ def run(dry: bool = False) -> int:
         state[job.url] = now
         pushed += 1
 
+    _show("Afgewezen op titel", title_rejected)
+    _show("Afgewezen op tekst", text_rejected)
     if not dry:
         save_state(state)
-    print(f"Klaar: {len(to_push)} nieuwe matches, {pushed} gemeld.")
-    return 0
+    print(f"Klaar: {len(candidates)} titel-matches, {len(text_rejected)} afgewezen op tekst, "
+          f"{unchecked} tekst niet te lezen, {pushed} gemeld.")
+    return 2 if errors else 0  # niet-nul exitcode -> GitHub mailt je dat er iets stuk is
 
 
+# --------------------------------------------------------------------------
+# Hulpmiddelen om bronnen af te stellen
+# --------------------------------------------------------------------------
 def probe(url: str) -> None:
     r = requests.get(url, headers={"User-Agent": UA}, timeout=25)
     print(f"HTTP {r.status_code}, {len(r.text)} tekens")
@@ -287,9 +404,47 @@ def probe_mail(sender: str) -> None:
                     print(f"{a['href'][:150]}   |   {' '.join(a.get_text(' ').split())[:60]}")
 
 
+def diagnose() -> None:
+    """Per bron: hoeveel mails/links, welke titels, en voorbeeldlinks die NIET matchen."""
+    cfg = load_config()
+    matcher = Matcher(cfg)
+    for src in cfg.get("sources", []):
+        if not src.get("enabled", True):
+            continue
+        print(f"\n=== {src['name']} ({src['type']})")
+        try:
+            if src["type"] == "mail":
+                raws = fetch_mails(src["from_contains"], src.get("days", 3))
+                print(f"{len(raws)} mails van '{src['from_contains']}' in de laatste {src.get('days', 3)} dagen")
+                jobs, other = [], []
+                rx = re.compile(src["link_regex"])
+                for raw in raws:
+                    jobs += parse_mail(raw, src)
+                    msg = email.message_from_bytes(raw)
+                    for part in msg.walk():
+                        if part.get_content_type() == "text/html":
+                            for a in BeautifulSoup(_decode_part(part), "html.parser").find_all("a", href=True):
+                                if not rx.search(a["href"]):
+                                    other.append(a["href"][:110])
+                if raws and not jobs:
+                    print("  Mails gevonden maar GEEN link voldoet aan link_regex. Voorbeeldlinks uit de mail:")
+                    for h in other[:12]:
+                        print("   ", h)
+            else:
+                jobs = fetch_html_source(src)
+            uniq = {j.url: j for j in jobs}
+            print(f"{len(uniq)} unieke vacatures")
+            for j in list(uniq.values())[:25]:
+                ok, prio = matcher.check(j)
+                print(f"  {'JA ' if ok else 'nee'}{'*' if prio else ' '} {j.title[:70]}")
+        except Exception as e:
+            print(f"FOUT: {e}")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--diagnose", action="store_true")
     ap.add_argument("--probe")
     ap.add_argument("--probe-mail")
     args = ap.parse_args()
@@ -297,5 +452,7 @@ if __name__ == "__main__":
         probe(args.probe)
     elif args.probe_mail:
         probe_mail(args.probe_mail)
+    elif args.diagnose:
+        diagnose()
     else:
         sys.exit(run(dry=args.dry_run))

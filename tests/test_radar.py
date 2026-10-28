@@ -70,8 +70,8 @@ def test_parse_mail_uses_subject_when_anchor_is_generic():
     )
     src = {"name": "LinkedIn (mail)", "link_regex": r"linkedin\.com/(comm/)?jobs/view/\d+"}
     jobs = {j.url: j.title for j in radar.parse_mail(msg.as_bytes(), src)}
-    assert jobs["https://www.linkedin.com/comm/jobs/view/123456"] == "Nieuwe vacature: Junior Java Developer bij Acme"
-    assert jobs["https://www.linkedin.com/comm/jobs/view/789"] == "Backend Developer"
+    assert jobs["https://www.linkedin.com/jobs/view/123456"] == "Nieuwe vacature: Junior Java Developer bij Acme"
+    assert jobs["https://www.linkedin.com/jobs/view/789"] == "Backend Developer"
     assert len(jobs) == 2
 
 
@@ -133,3 +133,88 @@ def test_failed_notification_is_retried(tmp_path, monkeypatch):
     radar.run()
     state = json.loads((tmp_path / "seen.json").read_text())
     assert not any("111" in u for u in state)  # mislukte melding is niet als gezien gemarkeerd
+
+
+# ---------------------------------------------------------------- tekstfilter
+TF = {"max_years": 1, "reject_phrases": ["bewezen ervaring"]}
+
+
+def v(text):
+    return radar.experience_verdict(text, TF)[0]
+
+
+def test_experience_rejects_required_years():
+    assert v("Je hebt minimaal 3 jaar ervaring met Java.") is False
+    assert v("Minimum 2 years of experience with Spring Boot") is False
+    assert v("3+ years of relevant experience") is False
+    assert v("Ervaring: 2-4 jaar in een vergelijkbare functie") is False
+    assert v("Vous avez 5 ans d'expérience en Java") is False
+
+
+def test_experience_accepts_juniors():
+    assert v("0-2 jaar ervaring is voldoende") is True
+    assert v("1 jaar ervaring is welkom") is True
+    assert v("Je bent een starter met een bachelor in informatica.") is True
+    assert v("Wij bestaan al 20 jaar en groeien snel.") is True  # jaren buiten ervaring-zin
+
+
+def test_experience_soft_and_starter_overrides():
+    assert v("3 jaar ervaring is een pluspunt.") is True
+    assert v("5 years of experience is a plus") is True
+    assert v("Geen ervaring vereist, starters welkom. Ervaring van 3 jaar met Java.") is True
+    assert v("Starters zijn welkom! We vragen 4 jaar ervaring.") is True
+
+
+def test_reject_phrases():
+    assert v("Je beschikt over bewezen ervaring als developer.") is False
+
+
+def test_title_excludes_experienced():
+    m = radar.Matcher({"include": ["developer"], "exclude": ["ervaren", "medior"]})
+    assert m.check(radar.Job("x", "Ervaren Java Developer", "u"))[0] is False
+    assert m.check(radar.Job("x", "Medior Developer", "u"))[0] is False
+
+
+def test_run_text_filter_and_fetch_failure(tmp_path, monkeypatch):
+    sent = []
+    pages = {
+        "https://www.vdab.be/vindeenjob/vacatures/111/junior-java-developer": "Starters welkom. " * 40,
+        "https://www.vdab.be/vindeenjob/vacatures/73914373/java-developer-met-analytische-vaardigheden":
+            "Minimaal 4 jaar ervaring met Java. " * 20,
+    }
+    cfg = {**CFG, "text_filter": {"enabled": True, "max_years": 1, "on_fetch_fail": "notify"},
+           "sources": [{"name": "VDAB", "type": "html", "url": "https://www.vdab.be/", **SRC}]}
+    monkeypatch.setattr(radar, "STATE_FILE", tmp_path / "seen.json")
+    monkeypatch.setattr(radar, "load_config", lambda: cfg)
+    monkeypatch.setattr(radar, "notify", lambda t, job, p: sent.append((job.title, job.note)))
+    monkeypatch.setattr(radar, "fetch_text", lambda url: pages.get(url))
+    monkeypatch.setenv("NTFY_TOPIC", "t")
+
+    class R:
+        text = VDAB_HTML
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(radar.requests, "get", lambda *a, **k: R())
+    radar.run()
+    assert [t for t, _ in sent] == ["Junior Java Developer"]  # 4 jaar ervaring afgewezen
+
+    # fetch mislukt -> toch melden, met waarschuwing
+    sent.clear()
+    pages.clear()
+    (tmp_path / "seen.json").unlink()
+    radar.run()
+    assert len(sent) == 2 and all("niet gecontroleerd" in n for _, n in sent)
+
+
+def test_imap_login_failure_is_reported_once(monkeypatch, capsys):
+    radar._imap_cache.clear()
+    monkeypatch.delenv("IMAP_USER", raising=False)
+    cfg = {"sources": [{"name": f"M{i}", "type": "mail", "from_contains": "x", "link_regex": "x"}
+                       for i in range(3)]}
+    errors = []
+    radar.collect(cfg, errors)
+    assert errors == ["mail"]  # één melding, niet drie
+    assert capsys.readouterr().err.count("[FOUT]") == 1
+    radar._imap_cache.clear()

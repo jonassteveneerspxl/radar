@@ -23,6 +23,18 @@ De eerste run meldt maximaal 10 vacatures en markeert de rest als gezien, zodat 
 ### 3. Alerts op de sites (voor LinkedIn, Indeed, Jobat, ICTjob, VDAB)
 Maak per site een jobalert met je zoektermen (bv. "java junior", "software developer") en laat die naar je Gmail sturen. De radar leest die mails en meldt de vacatures meteen. Let op: de **snelheid hangt af van de alertfrequentie** van de site; kies overal de snelste optie ("direct"/"zodra beschikbaar" als die er is, anders dagelijks).
 
+## Tekstfilter (geen vacatures die ervaring eisen)
+
+Na de titelcheck leest de radar de vacaturepagina en wijst hij af wat meer ervaring vraagt dan `max_years` (standaard 1) in `config.yaml`. "3 jaar ervaring", "minimum 2 years of experience" en "2-4 jaar" worden afgewezen (ook in het Frans). "Is een pluspunt" of "nice to have" telt niet mee, en "starters welkom" of "geen ervaring vereist" laat de vacature altijd door.
+
+Let op: LinkedIn en Indeed blokkeren vaak de servers van GitHub. Dan kan de tekst niet gelezen worden en krijg je de melding toch, met de waarschuwing "⚠ tekst niet gecontroleerd". Wil je die liever niet, zet dan `on_fetch_fail: skip` (je mist dan wel vacatures).
+
+## Controleren wat er binnenkomt
+
+*Actions → radar → Run workflow → mode: diagnose.* De log toont per bron hoeveel mails en vacatures er zijn, welke titels door het filter komen (JA/nee) en, als een mail geen enkele herkende link bevat, voorbeeldlinks om de `link_regex` aan te passen. Een normale run toont daarnaast welke titels en teksten zijn afgewezen, zodat je ziet of het filter te streng is.
+
+Meldt een run `[FOUT] mail-login/lezen mislukt`, dan krijg je ook een mail van GitHub, want de run eindigt dan als mislukt.
+
 ## Afstellen
 
 Alles staat in `config.yaml`:
