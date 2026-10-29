@@ -12,6 +12,7 @@ Gebruik:
 from __future__ import annotations
 
 import argparse
+import base64
 import email
 import imaplib
 import json
@@ -19,6 +20,7 @@ import os
 import re
 import sys
 import time
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email.header import decode_header, make_header
@@ -46,6 +48,11 @@ class Job:
     title: str
     url: str
     note: str = ""
+    key: str = ""  # alternatieve ontdubbel-sleutel (bv. bron+titel als de link een unieke tracking-URL is)
+
+    @property
+    def id(self) -> str:
+        return self.key or self.url
 
 
 # --------------------------------------------------------------------------
@@ -66,9 +73,36 @@ def title_from_url(url: str) -> str:
     return re.sub(r"[-_]+", " ", slug).strip() or url
 
 
+def anchor_title(a) -> str:
+    """Eerste betekenisvolle tekstregel in een link. In alertmails is dat de functietitel;
+    bedrijf, plaats en 'Easy Apply' staan op de volgende regels en horen niet in de titelcheck."""
+    for line in a.get_text("\n").split("\n"):
+        line = " ".join(line.split())
+        if line and line.lower() not in GENERIC_TITLES:
+            return line
+    return ""
+
+
+def decode_tracking(href: str) -> str:
+    """Indeed-mails gebruiken cts.indeed.com/v3/<base64(gzip(...))>. Probeer die inhoud te lezen."""
+    m = re.search(r"/v3/([A-Za-z0-9_\-]+)", href)
+    if not m:
+        return ""
+    s = m.group(1)
+    try:
+        raw = base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+        return zlib.decompressobj(31).decompress(raw).decode("latin-1")
+    except Exception:
+        return ""
+
+
 def extract_links(html: str, base_url: str, link_regex: str, source: str,
-                  keep_params: tuple[str, ...] = (), fallback_title: str = "") -> list[Job]:
-    """Zoekt alle <a>-links die aan link_regex voldoen. Per URL houden we de langste tekst."""
+                  keep_params: tuple[str, ...] = (), fallback_title: str = "",
+                  key_by_title: bool = False) -> list[Job]:
+    """Zoekt alle <a>-links die aan link_regex voldoen. Per URL houden we de langste titel.
+
+    key_by_title: voor bronnen waar elke link een unieke tracking-URL is (Indeed-mail).
+    Dan ontdubbelen we op bron+titel en slaan we links zonder tekst over."""
     soup = BeautifulSoup(html, "html.parser")
     rx = re.compile(link_regex)
     best: dict[str, str] = {}
@@ -76,16 +110,25 @@ def extract_links(html: str, base_url: str, link_regex: str, source: str,
         href = urljoin(base_url, a["href"].strip())
         if not rx.search(href):
             continue
-        url = normalize_url(href, keep_params)
-        text = " ".join(a.get_text(" ").split())
-        if text.lower() in GENERIC_TITLES:
-            text = ""
+        keep_raw = False
+        if "cts.indeed.com/v3/" in href:
+            jk = re.search(r"jk=([0-9a-f]{16})", decode_tracking(href))
+            if jk:  # echte vacature-id gevonden in de tracking-link: nette URL gebruiken
+                href = f"https://be.indeed.com/viewjob?jk={jk.group(1)}"
+                keep_raw = True  # de ?jk= is het vacature-id: niet wegnormaliseren
+            else:
+                keep_raw = True  # tracking-URL heeft zijn query nodig om te werken
+        url = href.split("#")[0] if keep_raw else normalize_url(href, keep_params)
+        text = anchor_title(a)
         if len(text) > len(best.get(url, "")) or url not in best:
             best[url] = text
     jobs = []
     for url, text in best.items():
+        if key_by_title and not text:
+            continue
         title = text or fallback_title or title_from_url(url)
-        jobs.append(Job(source, title, url))
+        key = f"{source}|{text.lower()}" if key_by_title and "viewjob?jk=" not in url else ""
+        jobs.append(Job(source, title, url, key=key))
     return jobs
 
 
@@ -115,7 +158,7 @@ def fetch_html_source(src: dict) -> list[Job]:
                      timeout=25)
     r.raise_for_status()
     return extract_links(r.text, src["url"], src["link_regex"], src["name"],
-                         tuple(src.get("keep_params", [])))
+                         tuple(src.get("keep_params", [])), key_by_title=src.get("key_by_title", False))
 
 
 def _decode_part(part) -> str:
@@ -130,7 +173,8 @@ def parse_mail(raw: bytes, src: dict) -> list[Job]:
     for part in msg.walk():
         if part.get_content_type() == "text/html":
             jobs += extract_links(_decode_part(part), "", src["link_regex"], src["name"],
-                                  tuple(src.get("keep_params", [])), fallback_title=subject)
+                                  tuple(src.get("keep_params", [])), fallback_title=subject,
+                                  key_by_title=src.get("key_by_title", False))
     return jobs
 
 
@@ -320,15 +364,15 @@ def run(dry: bool = False) -> int:
     candidates: list[tuple[Job, bool]] = []
     title_rejected: list[str] = []
     for job in collect(cfg, errors):
-        if job.url in state or job.url in seen_this_run:
+        if job.id in state or job.id in seen_this_run:
             continue
-        seen_this_run.add(job.url)
+        seen_this_run.add(job.id)
         ok, prio = matcher.check(job)
         if ok:
             candidates.append((job, prio))
         else:
             title_rejected.append(job.title[:60])
-            state[job.url] = now  # niet relevant: meteen als gezien markeren
+            state[job.id] = now  # niet relevant: meteen als gezien markeren
 
     candidates.sort(key=lambda x: not x[1])  # prioriteit eerst
     to_push: list[tuple[Job, bool]] = []
@@ -344,14 +388,14 @@ def run(dry: bool = False) -> int:
             if text is None:
                 unchecked += 1
                 if tf.get("on_fetch_fail", "notify") == "skip":
-                    state[job.url] = now
+                    state[job.id] = now
                     continue
                 job.note = "⚠ tekst niet gecontroleerd, lees zelf na op ervaring"
             else:
                 ok, reason = experience_verdict(text, tf)
                 if not ok:
                     text_rejected.append(f"{job.title[:45]} [{reason}]")
-                    state[job.url] = now
+                    state[job.id] = now
                     continue
                 job.note = f"✓ {reason}" if reason else ""
         to_push.append((job, prio))
@@ -359,7 +403,7 @@ def run(dry: bool = False) -> int:
     pushed = 0
     for i, (job, prio) in enumerate(to_push):
         if first_run and i >= MAX_FIRST_RUN_PUSHES:
-            state[job.url] = now  # eerste run: niet je telefoon overspoelen
+            state[job.id] = now  # eerste run: niet je telefoon overspoelen
             continue
         if dry:
             print(f"  [DRY] {'*' if prio else ' '} {job.source}: {job.title} {job.note} -> {job.url}")
@@ -369,7 +413,7 @@ def run(dry: bool = False) -> int:
             except Exception as e:
                 print(f"[FOUT] melding mislukt voor {job.url}: {e}", file=sys.stderr)
                 continue  # niet als gezien markeren, volgende run opnieuw proberen
-        state[job.url] = now
+        state[job.id] = now
         pushed += 1
 
     _show("Afgewezen op titel", title_rejected)
@@ -416,7 +460,7 @@ def diagnose() -> None:
             if src["type"] == "mail":
                 raws = fetch_mails(src["from_contains"], src.get("days", 3))
                 print(f"{len(raws)} mails van '{src['from_contains']}' in de laatste {src.get('days', 3)} dagen")
-                jobs, other = [], []
+                jobs, other, tracking = [], {}, ""
                 rx = re.compile(src["link_regex"])
                 for raw in raws:
                     jobs += parse_mail(raw, src)
@@ -424,15 +468,20 @@ def diagnose() -> None:
                     for part in msg.walk():
                         if part.get_content_type() == "text/html":
                             for a in BeautifulSoup(_decode_part(part), "html.parser").find_all("a", href=True):
+                                if "cts.indeed.com/v3/" in a["href"] and not tracking:
+                                    tracking = decode_tracking(a["href"])
                                 if not rx.search(a["href"]):
-                                    other.append(a["href"][:110])
-                if raws and not jobs:
-                    print("  Mails gevonden maar GEEN link voldoet aan link_regex. Voorbeeldlinks uit de mail:")
-                    for h in other[:12]:
-                        print("   ", h)
+                                    other.setdefault(a["href"][:90], anchor_title(a)[:50])
+                if other:
+                    print(f"  {len(other)} links die NIET matchen met link_regex (voorbeelden, link | tekst):")
+                    for h, t in list(other.items())[:8]:
+                        print(f"    {h} | {t}")
+                if tracking:
+                    shown = "".join(c if c.isprintable() else "." for c in tracking)[:400]
+                    print(f"  Inhoud van een Indeed-tracking-link (gedecodeerd): {shown}")
             else:
                 jobs = fetch_html_source(src)
-            uniq = {j.url: j for j in jobs}
+            uniq = {j.id: j for j in jobs}
             print(f"{len(uniq)} unieke vacatures")
             for j in list(uniq.values())[:25]:
                 ok, prio = matcher.check(j)

@@ -218,3 +218,37 @@ def test_imap_login_failure_is_reported_once(monkeypatch, capsys):
     assert errors == ["mail"]  # één melding, niet drie
     assert capsys.readouterr().err.count("[FOUT]") == 1
     radar._imap_cache.clear()
+
+
+# ------------------------------------------------- titel uit mail-kaartjes / Indeed
+def test_card_anchor_uses_title_only_not_company():
+    html = ('<a href="https://www.linkedin.com/comm/jobs/view/42?trk=x">'
+            '<div>Data Analyst</div><div>NTek Software Solutions · Mechelen (Hybrid)</div>'
+            '<span>Easy Apply</span></a>')
+    jobs = radar.extract_links(html, "", r"linkedin\.com/(comm/)?jobs/view/\d+", "LinkedIn")
+    assert [j.title for j in jobs] == ["Data Analyst"]
+    m = radar.Matcher({"include": ["developer", "engineer"], "exclude": ["business developer"]})
+    assert m.check(jobs[0])[0] is False  # "Software" in de bedrijfsnaam telt niet mee
+    assert m.check(radar.Job("x", "Business Developer & Ondernemer", "u"))[0] is False
+    assert m.check(radar.Job("x", "(Junior) Engineer", "u"))[0] is True
+
+
+def test_indeed_tracking_links_dedupe_by_title():
+    html = ('<a href="https://cts.indeed.com/v3/AAAA?x=1">Java Developer</a>'
+            '<a href="https://cts.indeed.com/v3/BBBB?x=2">Java Developer</a>'
+            '<a href="https://cts.indeed.com/v3/CCCC?x=3"><img src="logo.png"></a>'
+            '<a href="https://cts.indeed.com/v3/DDDD?x=4">Backend Developer</a>')
+    jobs = radar.extract_links(html, "", r"cts\.indeed\.com/v3/", "Indeed (mail)", key_by_title=True)
+    ids = {j.id for j in jobs}
+    assert ids == {"Indeed (mail)|java developer", "Indeed (mail)|backend developer"}
+    assert all(j.url.startswith("https://cts.indeed.com/v3/") for j in jobs)  # link blijft klikbaar
+
+
+def test_indeed_tracking_with_job_id_becomes_clean_url():
+    import base64
+    import gzip
+    payload = base64.urlsafe_b64encode(gzip.compress(b"foo&jk=0123456789abcdef&bar")).decode().rstrip("=")
+    html = f'<a href="https://cts.indeed.com/v3/{payload}?z=1">Java Developer</a>'
+    jobs = radar.extract_links(html, "", r"cts\.indeed\.com/v3/", "Indeed (mail)", key_by_title=True)
+    assert jobs[0].url == "https://be.indeed.com/viewjob?jk=0123456789abcdef"
+    assert jobs[0].id == jobs[0].url

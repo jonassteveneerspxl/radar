@@ -23,7 +23,7 @@ include:
   - programmeur
   - analist programmeur
   - analyst programmer
-  - software
+  - engineer
   - application developer
   - applicatieontwikkelaar
   - développeur
@@ -36,6 +36,10 @@ exclude:
   - mid-level
   - confirmé
   - gevorderd
+  - business developer
+  - business development
+  - sales
+  - recruiter
   - senior
   - sr
   - lead
@@ -134,8 +138,10 @@ sources:
   - name: Indeed (mail)
     type: mail
     from_contains: "indeed.com"
-    link_regex: "indeed\\.com/(rc/clk|viewjob)"
-    keep_params: ["jk"]       # bij Indeed zit het vacature-id in ?jk=...
+    # Indeed-mails bevatten enkel trackinglinks (cts.indeed.com/v3/...), geen vacature-id.
+    # Daarom ontdubbelen we op titel i.p.v. op link.
+    link_regex: "cts\\.indeed\\.com/v3/|indeed\\.com/(rc/clk|viewjob)"
+    key_by_title: true
 
   - name: ICTjob (mail)
     type: mail
